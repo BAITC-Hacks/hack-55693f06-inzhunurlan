@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtual environment
+.venv/
+venv/
+
+# Environment variables / secrets
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Tests
+.pytest_cache/
+
+# Generated cache
+cache/
+
+# Streamlit
+.streamlit/secrets.toml
