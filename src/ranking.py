@@ -45,12 +45,17 @@ def openai_scores(
     from openai import OpenAI
 
     inputs = [text, *documents]
-    with OpenAI(api_key=api_key, timeout=10.0, max_retries=0) as client:
+    client = OpenAI(api_key=api_key, timeout=10.0, max_retries=0)
+    try:
         response = client.embeddings.create(
             model="text-embedding-3-small",
             input=inputs,
             encoding_format="float",
         )
+    finally:
+        close = getattr(client, "close", None)
+        if callable(close):
+            close()
     # Match vectors to inputs explicitly, even if response items are unordered.
     items = sorted(response.data, key=lambda item: item.index)
     if [item.index for item in items] != list(range(len(inputs))):
@@ -71,18 +76,27 @@ def semantic_scores(
     query: SearchQuery,
     *,
     use_openai: bool = True,
+    diagnostic: dict[str, str] | None = None,
 ) -> tuple[np.ndarray, str]:
-    """Prefer embeddings; fall back as a whole batch on any provider failure."""
+    """Prefer embeddings and record a safe reason whenever fallback occurs."""
     text = query_text(query)
     documents = [contractor_text(row) for _, row in candidates.iterrows()]
     api_key = os.environ.get("OPENAI_API_KEY", "").strip()
-    if use_openai and api_key and documents:
+    reason = ""
+    if not use_openai:
+        reason = "openai_disabled"
+    elif not api_key:
+        reason = "missing_api_key"
+    elif not documents:
+        reason = "no_candidates"
+    else:
         try:
             return openai_scores(text, documents, api_key), "openai"
-        except Exception:
-            # Provider outages, timeouts and malformed responses must not stop
-            # recommendations. Do not log exceptions that might contain secrets.
-            pass
+        except Exception as exc:
+            # Keep diagnostics to an exception type; messages can contain secrets.
+            reason = f"openai_error:{type(exc).__name__}"
+    if diagnostic is not None:
+        diagnostic["semantic_fallback_reason"] = reason
     return tfidf_scores(text, documents), "tfidf"
 
 
@@ -121,7 +135,7 @@ def rank_candidates(
     *,
     use_openai: bool = True,
 ) -> pd.DataFrame:
-    """Return up to three eligible contractors with scores and original fields.
+    """Return all eligible contractors with scores and original fields.
 
     Call city_category_candidates(), then filter_candidates(), before this
     function. Invalid input fails closed using existing eligibility rules;
@@ -139,6 +153,9 @@ def rank_candidates(
         for column in ("semantic_score", "budget_score", "duration_score", "final_score"):
             ranked[column] = pd.Series(index=ranked.index, dtype=float)
         ranked["semantic_provider"] = pd.Series(index=ranked.index, dtype=str)
+        ranked["semantic_fallback_reason"] = pd.Series(
+            index=ranked.index, dtype=str
+        )
         return ranked
 
     if len(city_category_candidates(ranked, query)) != len(ranked) or any(
@@ -152,9 +169,18 @@ def rank_candidates(
     ranked["duration_score"] = [
         duration_score(hours, query.duration_hours) for hours in ranked["max_hours"]
     ]
-    scores, provider = semantic_scores(ranked, query, use_openai=use_openai)
+    semantic_diagnostic: dict[str, str] = {}
+    scores, provider = semantic_scores(
+        ranked,
+        query,
+        use_openai=use_openai,
+        diagnostic=semantic_diagnostic,
+    )
     ranked["semantic_score"] = scores
     ranked["semantic_provider"] = provider
+    ranked["semantic_fallback_reason"] = semantic_diagnostic.get(
+        "semantic_fallback_reason", ""
+    )
     ranked["final_score"] = (
         0.65 * ranked["semantic_score"]
         + 0.25 * ranked["budget_score"]

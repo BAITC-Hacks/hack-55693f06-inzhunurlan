@@ -5,7 +5,12 @@ import pytest
 from src.data_loader import load_contractors
 from src.filters import city_category_candidates, filter_candidates
 from src.models import SearchQuery
-from src.ranking import budget_score, duration_score, rank_candidates
+from src.ranking import (
+    budget_score,
+    duration_score,
+    rank_candidates,
+    semantic_scores,
+)
 
 
 QUERY = SearchQuery(
@@ -48,6 +53,57 @@ def test_preserves_catalogue_fields_and_adds_scores():
     ):
         assert ranked[column].between(0, 1).all()
     assert (ranked.semantic_provider == "tfidf").all()
+    assert (ranked.semantic_fallback_reason == "openai_disabled").all()
+
+
+def test_successful_mocked_openai_embeddings_use_openai(monkeypatch):
+    candidates = eligible_candidates().iloc[:2]
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+    class Response:
+        data = [
+            type("Embedding", (), {"index": 0, "embedding": [1.0, 0.0]})(),
+            type("Embedding", (), {"index": 1, "embedding": [1.0, 0.0]})(),
+            type("Embedding", (), {"index": 2, "embedding": [0.0, 1.0]})(),
+        ]
+
+    class Embeddings:
+        def create(self, **kwargs):
+            return Response()
+
+    class Client:
+        embeddings = Embeddings()
+
+        def __init__(self, **kwargs):
+            assert kwargs["timeout"] == 10.0
+            assert kwargs["max_retries"] == 0
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("openai.OpenAI", Client)
+    ranked = rank_candidates(candidates, QUERY)
+    assert (ranked.semantic_provider == "openai").all()
+    assert (ranked.semantic_fallback_reason == "").all()
+
+
+def test_missing_key_uses_tfidf_with_reason(monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    ranked = rank_candidates(eligible_candidates().iloc[:1], QUERY)
+    assert ranked.semantic_provider.iloc[0] == "tfidf"
+    assert ranked.semantic_fallback_reason.iloc[0] == "missing_api_key"
+
+
+def test_openai_exception_uses_tfidf_with_safe_reason(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+    def fail(*args, **kwargs):
+        raise TimeoutError("secret-looking details must not be exposed")
+
+    monkeypatch.setattr("src.ranking.openai_scores", fail)
+    ranked = rank_candidates(eligible_candidates().iloc[:1], QUERY)
+    assert ranked.semantic_provider.iloc[0] == "tfidf"
+    assert ranked.semantic_fallback_reason.iloc[0] == "openai_error:TimeoutError"
 
 
 def test_tie_breaks_by_price_then_id():
